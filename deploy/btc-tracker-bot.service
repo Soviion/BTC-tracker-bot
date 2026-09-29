@@ -1,0 +1,38 @@
+# systemd-юнит: бот стартует при загрузке сервера и перезапускается при любом падении.
+#
+# Установка (на сервере, от root или через sudo):
+#   1. Отредактируйте User=, WorkingDirectory=, ExecStart= и, если нужно, After=/Wants= ниже —
+#      замените /opt/btc-tracker-bot на реальный путь проекта, а btcbot — на реального пользователя
+#      (создать: sudo useradd -r -m -s /usr/sbin/nologin btcbot).
+#   2. sudo cp deploy/btc-tracker-bot.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now btc-tracker-bot
+#
+# Проверить: systemctl status btc-tracker-bot   |   journalctl -u btc-tracker-bot -f
+
+[Unit]
+Description=BTC Tracker Bot (Telegram)
+After=network-online.target postgresql.service
+Wants=network-online.target
+# Если PostgreSQL на ДРУГОМ сервере — уберите "postgresql.service" из After= выше, он не установлен локально.
+
+[Service]
+Type=simple
+User=btcbot
+Group=btcbot
+WorkingDirectory=/opt/btc-tracker-bot
+EnvironmentFile=/opt/btc-tracker-bot/.env
+ExecStart=/opt/btc-tracker-bot/.venv/bin/python -m bot
+Restart=always
+RestartSec=5
+# Не даём systemd «сдаться» после нескольких быстрых падений подряд (например, сразу после
+# перезагрузки сервера, пока не поднялась сеть или БД) — повторяем попытки без ограничения по времени.
+StartLimitIntervalSec=0
+
+# Немного изоляции по умолчанию — не мешает работе бота.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+# Альтернатива systemd-юниту (deploy/btc-tracker-bot.service) — запуск бота в контейнере.
+# restart: unless-stopped — Docker сам поднимет контейнер после падения и после перезагрузки сервера
+# (при условии, что запущен сам Docker, обычно через systemd — это стандартная настройка дистрибутивов).
+#
+# PostgreSQL здесь НЕ описан: подразумевается, что вы используете свою БД на этом же сервере
+# или на другом. Если она на этом же сервере (не в Docker) — "localhost" внутри контейнера
+# указывает на сам контейнер, а не на хост, поэтому в DATABASE_URL пропишите host.docker.internal
+# (см. extra_hosts ниже) вместо localhost/127.0.0.1.
+
+services:
+  bot:
+    build: .
+    container_name: btc-tracker-bot
+    restart: unless-stopped
+    env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway" # даёт контейнеру достучаться до Postgres на хосте

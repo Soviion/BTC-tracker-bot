@@ -1,0 +1,22 @@
+# Секреты и локальные настройки
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Виртуальное окружение
+.venv/
+venv/
+
+# Логи
+logs/
+*.log
+
+# IDE / ОС
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
