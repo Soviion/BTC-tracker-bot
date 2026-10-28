@@ -450,16 +450,23 @@ def render_startup_owner(
     prev_alive: float | None,
     version: str,
     stale_after: float = 180.0,
+    booted_at: float | None = None,
 ) -> str:
-    head = [f"🟢 <b>Бот запущен</b> · {fmt_clock(now, tz)} ({tz_label(tz_name)}) · v{esc(version)}"]
+    """`now` — момент доставки, `booted_at` — момент запуска бота. Они различаются, если сводка ждала
+    интернет/Telegram: тогда в шапке показываем настоящее время запуска и поясняем задержку."""
+    boot = now if booted_at is None else booted_at
+    head = [f"🟢 <b>Бот запущен</b> · {fmt_clock(boot, tz)} ({tz_label(tz_name)}) · v{esc(version)}"]
     if prev_alive is None:
         head.append("Первый запуск.")
     else:
-        gap = now - prev_alive
+        gap = boot - prev_alive
         if gap >= 120:
             head.append(f"⏱ Простой: {humanize_duration(gap)} (с {fmt_dt(prev_alive, tz)}) — сервер был выключен или бот падал.")
         else:
             head.append("Перезапуск без простоя.")
+    delay = now - boot
+    if delay >= 120:
+        head.append(f"📡 Сводка задержалась на {humanize_duration(delay)}: после запуска не было связи с источниками курсов или Telegram.")
     rates_block = render_rates(snap, stats, now=now, tz=tz, title="📊 Курсы сейчас", stale_after=stale_after)
     return "\n".join(head) + "\n\n" + rates_block
 
@@ -483,7 +490,7 @@ def render_report(snap: Snapshot, stats: PriceStats | None, *, slot_label: str, 
     title = f"📊 Сводка · {slot_label}"
     text = render_rates(snap, stats, now=now, tz=tz, title=title, stale_after=stale_after)
     if late_minutes >= 3:
-        text += f"\n<i>⏱ Сводка за {slot_label} отправлена с опозданием: бот был недоступен.</i>"
+        text += f"\n<i>⏱ Сводка за {slot_label} отправлена с опозданием: был сбой связи или бот был недоступен.</i>"
     return text
 
 

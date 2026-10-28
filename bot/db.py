@@ -479,6 +479,10 @@ class Database:
         )
         return _rowcount(tag) == 1
 
+    async def release_report(self, day: str, slot: str) -> None:
+        """Снимает отметку «сводка отправлена»: если доставка не удалась из-за сбоя связи, её повторят позже."""
+        await self._p.execute("DELETE FROM report_log WHERE day = $1 AND slot = $2", day, slot)
+
     async def prune(self, now: int | None = None, *, history_days: int = 8) -> None:
         """Чистка: старая история цен, использованные/просроченные приглашения, давно сработавшие алерты."""
         now = int(time.time()) if now is None else now

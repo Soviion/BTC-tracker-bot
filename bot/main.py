@@ -10,22 +10,26 @@ import time
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.exceptions import (
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramServerError,
+    TelegramUnauthorizedError,
+)
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
-from . import __version__, texts
+from . import __version__
 from .access import AccessService
 from .alerts import AlertService
 from .config import ConfigError, Settings, configure_logging, load_settings
 from .db import Database
 from .handlers import build_router
-from .history import load_stats
 from .middlewares import AccessMiddleware, StateResetMiddleware
 from .notify import Notifier
 from .rates.http import JsonFetcher
 from .rates.service import RateService
-from .scheduler import SchedulerContext, get_last_alive, start_background_tasks
+from .scheduler import SchedulerContext, get_last_alive, start_background_tasks, start_startup_report_task
 
 log = logging.getLogger(__name__)
 
@@ -46,25 +50,37 @@ DB_CONNECT_MAX_ATTEMPTS = 60
 DB_CONNECT_RETRY_DELAY = 5.0
 
 
-async def _verify_token_or_exit(bot: Bot) -> None:
-    """Быстрая проверка BOT_TOKEN перед долгой инициализацией (БД, опрос курсов). Неверный токен —
-    единственная стартовая ошибка, повтор которой заведомо бесполезен, поэтому именно её проверяем
-    заранее и выходим с понятным сообщением, а не разбираемся в этом уже после подключения к БД.
-    Сетевые сбои здесь не фатальны — их подхватит собственный retry/backoff aiogram при polling."""
-    try:
-        me = await bot.get_me()
-    except TelegramUnauthorizedError:
-        print(
-            "❌ Telegram отклонил BOT_TOKEN (неверный или отозванный токен). "
-            "Проверьте значение BOT_TOKEN в .env — его нужно скопировать из @BotFather целиком.",
-            file=sys.stderr,
-        )
-        await bot.session.close()
-        raise SystemExit(1) from None
-    except Exception as exc:  # noqa: BLE001 — сеть/Telegram недоступны сейчас — не фатально, попробуем позже
-        log.warning("не удалось сразу проверить BOT_TOKEN (%s) — продолжаю, polling попробует ещё раз", exc)
-    else:
-        log.info("авторизован в Telegram как @%s (id %d)", me.username, me.id)
+async def _verify_token_or_exit(bot: Bot, *, retry_delay: float = 10.0, sleep=asyncio.sleep) -> None:
+    """Проверка BOT_TOKEN до долгой инициализации (БД, опрос курсов).
+
+    * Неверный токен — единственная стартовая ошибка, повтор которой заведомо бесполезен: выходим с
+      понятным сообщением и кодом 1.
+    * Нет связи с Telegram (например, сервер только что включили, а интернет ещё не поднялся) — ждём и
+      повторяем, а не падаем. Это важно ещё и потому, что `start_polling` в aiogram сам вызывает
+      `bot.me()` ДО своего цикла с backoff: если бы мы не заполнили этот кэш здесь, нет сети в этот
+      момент означало бы падение процесса.
+    """
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            me = await bot.me()  # кэшируется внутри Bot — повторный вызов в start_polling уже без сети
+        except TelegramUnauthorizedError:
+            print(
+                "❌ Telegram отклонил BOT_TOKEN (неверный или отозванный токен). "
+                "Проверьте значение BOT_TOKEN (в .env или в environment контейнера) — его нужно скопировать "
+                "из @BotFather целиком.",
+                file=sys.stderr,
+            )
+            await bot.session.close()
+            raise SystemExit(1) from None
+        except (TelegramNetworkError, TelegramServerError, TelegramRetryAfter) as exc:
+            if attempt == 1 or attempt % 12 == 0:  # не заваливаем лог: первая попытка и затем раз в пару минут
+                log.warning("нет связи с Telegram (попытка %d): %s — повторяю каждые %.0fс", attempt, exc, retry_delay)
+            await sleep(retry_delay)
+        else:
+            log.info("авторизован в Telegram как @%s (id %d)", me.username, me.id)
+            return
 
 
 async def _connect_db_with_retry(settings: Settings) -> Database:
@@ -90,32 +106,35 @@ async def _connect_db_with_retry(settings: Settings) -> Database:
     raise AssertionError("unreachable")  # pragma: no cover
 
 
-async def _send_startup_reports(ctx: SchedulerContext, prev_alive: float | None, now: float) -> None:
-    settings = ctx.settings
-    if settings.startup_report == "off":
-        return
-    if prev_alive is not None and now - prev_alive < settings.startup_min_gap:
-        log.info("пропускаю стартовое сообщение о курсах — слишком быстрый перезапуск (защита от спама)")
-        return
+def build_dispatcher(
+    *,
+    db: Database,
+    access: AccessService,
+    rates: RateService,
+    alert_service: AlertService,
+    notifier: Notifier,
+    settings: Settings,
+    started_at: float,
+) -> Dispatcher:
+    """Диспетчер aiogram со всеми зависимостями, middleware и роутерами. Вынесено из run(), чтобы тесты
+    прогоняли те же самые обработчики, что и боевой бот (см. tests/test_handlers_e2e.py)."""
+    dp = Dispatcher(storage=MemoryStorage())
+    dp["db"] = db
+    dp["access"] = access
+    dp["rates"] = rates
+    dp["alert_service"] = alert_service
+    dp["notifier"] = notifier
+    dp["settings"] = settings
+    dp["version"] = __version__
+    dp["started_at"] = started_at
 
-    snap = ctx.rates.snapshot()
-    if snap.btc is None:
-        await ctx.notifier.notify_owners(settings.owner_ids, texts.render_startup_no_data(now, settings.tz))
-        return
-
-    stats = await load_stats(ctx.db, now, snap.btc.price)
-    owner_text = texts.render_startup_owner(
-        snap, stats, now=now, tz=settings.tz, tz_name=settings.tz_name, prev_alive=prev_alive,
-        version=ctx.version, stale_after=settings.stale_after,
-    )
-    await ctx.notifier.notify_owners(settings.owner_ids, owner_text)
-
-    if settings.startup_report == "all":
-        users = await ctx.db.list_users()
-        others = [u.user_id for u in users if u.user_id not in settings.owner_ids and not u.bot_blocked]
-        if others:
-            user_text = texts.render_startup_user(snap, stats, now=now, tz=settings.tz, stale_after=settings.stale_after)
-            await ctx.notifier.broadcast(others, user_text)
+    state_reset = StateResetMiddleware()
+    access_middleware = AccessMiddleware()
+    for observer in (dp.message, dp.callback_query):
+        observer.outer_middleware(state_reset)
+        observer.outer_middleware(access_middleware)
+    dp.include_router(build_router())
+    return dp
 
 
 async def run() -> None:
@@ -144,28 +163,15 @@ async def run() -> None:
     alert_service = AlertService(db, max_per_user=settings.max_alerts_per_user)
     notifier = Notifier(bot, db)
 
-    dp = Dispatcher(storage=MemoryStorage())
-    dp["db"] = db
-    dp["access"] = access
-    dp["rates"] = rate_service
-    dp["alert_service"] = alert_service
-    dp["notifier"] = notifier
-    dp["settings"] = settings
-    dp["version"] = __version__
-    started_at = time.time()
-    dp["started_at"] = started_at
-
-    state_reset = StateResetMiddleware()
-    access_middleware = AccessMiddleware()
-    for observer in (dp.message, dp.callback_query):
-        observer.outer_middleware(state_reset)
-        observer.outer_middleware(access_middleware)
-    dp.include_router(build_router())
+    dp = build_dispatcher(
+        db=db, access=access, rates=rate_service, alert_service=alert_service, notifier=notifier,
+        settings=settings, started_at=time.time(),
+    )
 
     try:
         await bot.set_my_commands([BotCommand(command=c, description=d) for c, d in BOT_COMMANDS])
-    except Exception:  # noqa: BLE001 — список команд не критичен для работы бота
-        log.exception("не удалось задать список команд бота")
+    except Exception as exc:  # noqa: BLE001 — список команд не критичен для работы бота
+        log.warning("не удалось задать список команд бота: %s", exc)
 
     log.info("первый опрос источников курсов…")
     await rate_service.poll()
@@ -174,11 +180,13 @@ async def run() -> None:
     else:
         log.warning("после первого опроса цена BTC так и не получена — проверьте интернет (python -m bot --check-apis)")
 
+    # prev_alive читаем ДО запуска фоновых циклов: первый же тик опроса перезапишет эту отметку.
     prev_alive = await get_last_alive(db)
     ctx = SchedulerContext(settings=settings, db=db, rates=rate_service, notifier=notifier, version=__version__)
-    await _send_startup_reports(ctx, prev_alive, time.time())
-
     tasks = start_background_tasks(ctx)
+    # Стартовая сводка — отдельной задачей: она может ждать появления интернета/Telegram (после включения
+    # сервера он нередко поднимается позже бота), и это не должно задерживать запуск polling.
+    tasks.append(start_startup_report_task(ctx, prev_alive, time.time()))
     log.info("бот запущен, начинаю polling")
     try:
         await dp.start_polling(bot)

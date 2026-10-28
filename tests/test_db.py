@@ -240,3 +240,10 @@ async def test_prune_removes_old_history_and_keeps_recent(db: Database) -> None:
 
     series = await db.price_series(0)
     assert [ts for ts, _ in series] == [NOW - 86400]
+
+
+async def test_release_report_allows_claiming_again(db: Database) -> None:
+    assert await db.claim_report("2026-01-01", "08:00", NOW) is True
+    await db.release_report("2026-01-01", "08:00")
+    assert await db.claim_report("2026-01-01", "08:00", NOW) is True  # снова можно «занять» слот
+    await db.release_report("2026-01-01", "no-such-slot")  # снятие несуществующей отметки — не ошибка

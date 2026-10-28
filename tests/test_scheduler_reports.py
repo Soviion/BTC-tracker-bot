@@ -1,9 +1,9 @@
-"""Планирование ежедневных сводок: окно «прощения» опозданий и переход через полночь."""
+"""Планирование ежедневных сводок: окно «прощения» опозданий, переход через полночь, повтор при сбое связи."""
 
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from bot.config import load_settings
 from bot.db import Database
@@ -40,6 +40,19 @@ class FakeNotifier:
 
     async def notify_owners(self, owner_ids, text, reply_markup=None) -> BroadcastStats:
         return await self.broadcast(owner_ids, text, reply_markup)
+
+
+class FlakyNotifier(FakeNotifier):
+    """Результаты broadcast() выдаются по очереди из `outcomes` (когда очередь кончилась — всё доставлено)."""
+
+    def __init__(self, outcomes: list[BroadcastStats]) -> None:
+        super().__init__()
+        self._outcomes = list(outcomes)
+
+    async def broadcast(self, recipients, text, reply_markup=None, *, silent=False) -> BroadcastStats:
+        recipients = list(recipients)
+        self.broadcasts.append((recipients, text))
+        return self._outcomes.pop(0) if self._outcomes else BroadcastStats(sent=len(recipients), retry=0, failed=0)
 
 
 def make_settings(**overrides: str):
@@ -121,3 +134,43 @@ async def test_respects_per_user_report_off_setting(db: Database) -> None:
     assert len(notifier.broadcasts) == 1
     recipients = notifier.broadcasts[0][0]
     assert 1 in recipients and 2 not in recipients
+
+
+async def test_report_is_retried_after_total_delivery_failure(db: Database) -> None:
+    """Telegram моргнул ровно в момент отправки: сводка не должна пропасть — повторяем на следующих тиках."""
+    await db.add_user(1, full_name="Owner")
+    notifier = FlakyNotifier([BroadcastStats(sent=0, retry=1, failed=0)])  # 1-я попытка — нет связи
+    ctx = make_ctx(db, notifier)
+
+    now = datetime.now(ctx.settings.tz).replace(hour=8, minute=0, second=0, microsecond=0)
+    await _maybe_send_reports(ctx, now)
+    await _maybe_send_reports(ctx, now + timedelta(seconds=20))  # связь вернулась — доставлено
+    await _maybe_send_reports(ctx, now + timedelta(seconds=40))  # уже доставлено — повторов нет
+
+    assert len(notifier.broadcasts) == 2
+
+
+async def test_report_not_retried_after_partial_delivery(db: Database) -> None:
+    """Если хоть кому-то доставлено — отметку не снимаем, иначе доставившим пришли бы дубли."""
+    await db.add_user(1, full_name="Owner")
+    await db.add_user(2, full_name="Friend")
+    notifier = FlakyNotifier([BroadcastStats(sent=1, retry=1, failed=0)])
+    ctx = make_ctx(db, notifier)
+
+    now = datetime.now(ctx.settings.tz).replace(hour=8, minute=0, second=0, microsecond=0)
+    await _maybe_send_reports(ctx, now)
+    await _maybe_send_reports(ctx, now + timedelta(seconds=20))
+
+    assert len(notifier.broadcasts) == 1
+
+
+async def test_report_retry_stops_when_grace_window_is_over(db: Database) -> None:
+    await db.add_user(1, full_name="Owner")
+    notifier = FlakyNotifier([BroadcastStats(sent=0, retry=1, failed=0)] * 100)  # связи нет совсем
+    ctx = make_ctx(db, notifier)
+
+    start = datetime.now(ctx.settings.tz).replace(hour=8, minute=0, second=0, microsecond=0)
+    for tick in range(0, 60 * 40, 20):  # 40 минут тиков по 20 секунд; окно прощения — 15 минут
+        await _maybe_send_reports(ctx, start + timedelta(seconds=tick))
+
+    assert len(notifier.broadcasts) == 15 * 60 // 20 + 1  # попытки только внутри окна прощения

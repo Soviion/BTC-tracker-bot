@@ -156,7 +156,7 @@ def load_settings(env: Mapping[str, str] | None = None, *, require_token: bool =
         if _is_placeholder(token):
             raise ConfigError(
                 "Не задан BOT_TOKEN. Создайте бота у @BotFather (команда /newbot), "
-                "скопируйте токен и вставьте в файл .env: BOT_TOKEN=123456:AA..."
+                "скопируйте токен и укажите его в .env (BOT_TOKEN=123456:AA...) или в environment контейнера."
             )
         if not TOKEN_RE.match(token):
             raise ConfigError(
@@ -169,9 +169,9 @@ def load_settings(env: Mapping[str, str] | None = None, *, require_token: bool =
     database_url = env.get("DATABASE_URL", "").strip()
     if _is_placeholder(database_url):
         raise ConfigError(
-            "Не задан DATABASE_URL. Укажите адрес вашей PostgreSQL, например:\n"
+            "Не задан DATABASE_URL (в .env или в environment контейнера). Укажите адрес вашей PostgreSQL, например:\n"
             "DATABASE_URL=postgresql://btc_bot:пароль@localhost:5432/btc_tracker\n"
-            "(создайте пользователя и базу заранее: createuser/createdb или CREATE ROLE / CREATE DATABASE)."
+            "(пользователя и базу нужно создать заранее: createuser/createdb или CREATE ROLE / CREATE DATABASE)."
         )
     if not _DSN_RE.match(database_url):
         raise ConfigError(

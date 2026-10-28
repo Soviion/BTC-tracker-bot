@@ -14,7 +14,7 @@ from .alerts import process_alerts
 from .config import Settings
 from .db import Alert, Database
 from .history import load_stats
-from .notify import Notifier
+from .notify import BroadcastStats, Notifier, SendResult
 from .rates.models import Snapshot
 from .rates.service import RateService
 
@@ -26,6 +26,12 @@ FIAT_DOWN_NOTIFY_AFTER = 3 * 3600.0  # 3 часа — НБРБ обновляе�
 MAINTENANCE_FIRST_DELAY = 300.0
 MAINTENANCE_INTERVAL = 24 * 3600.0
 REPORT_CHECK_INTERVAL = 20.0
+
+# Стартовая сводка: после включения сервера интернет (роутер, провайдер) нередко появляется позже самого
+# бота — поэтому доставку не пытаемся сделать «один раз в момент запуска», а ждём связь до этого срока.
+STARTUP_REPORT_DEADLINE = 3600.0
+STARTUP_REPORT_RETRY = 15.0
+STARTUP_META_KEY = "last_startup_report_at"
 
 
 @dataclass
@@ -71,7 +77,7 @@ async def _poll_once(ctx: SchedulerContext) -> None:
     snap = await ctx.rates.poll()
     now = time.time()
     # Метка «жив на момент X» переживёт даже kill -9 / отключение питания — по ней при следующем
-    # запуске считаем длительность простоя для стартового сообщения (см. compute_startup_gap).
+    # запуске считаем длительность простоя для стартового сообщения (см. deliver_startup_report).
     await ctx.db.set_meta("last_alive_at", repr(now))
 
     if snap.btc is not None:
@@ -149,10 +155,15 @@ async def _maybe_send_reports(ctx: SchedulerContext, now_dt: datetime | None = N
             slot_str = slot.strftime("%H:%M")
             if not await ctx.db.claim_report(day, slot_str, int(now_dt.timestamp())):
                 continue  # уже отправлено (в этом тике или до перезапуска процесса)
-            await _send_report(ctx, slot_str, late_minutes=int(late // 60))
+            result = await _send_report(ctx, slot_str, late_minutes=int(late // 60))
+            if result.sent == 0 and result.retry > 0:
+                # Никому не доставлено из-за сбоя связи с Telegram: снимаем отметку, и следующий тик
+                # (через REPORT_CHECK_INTERVAL) повторит отправку — до конца окна прощения.
+                await ctx.db.release_report(day, slot_str)
+                log.warning("сводка %s не доставлена (нет связи с Telegram) — повторю на следующем тике", slot_str)
 
 
-async def _send_report(ctx: SchedulerContext, slot_str: str, *, late_minutes: int) -> None:
+async def _send_report(ctx: SchedulerContext, slot_str: str, *, late_minutes: int) -> BroadcastStats:
     now = time.time()
     snap = ctx.rates.snapshot()
     if ctx.rates.fresh_btc(now) is None:
@@ -168,6 +179,7 @@ async def _send_report(ctx: SchedulerContext, slot_str: str, *, late_minutes: in
         "сводка %s: получателей %d (доставлено %d, повтор %d, ошибок %d)",
         slot_str, len(recipients), result.sent, result.retry, result.failed,
     )
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -187,14 +199,101 @@ async def _maintenance_loop(ctx: SchedulerContext) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Стартовая сводка (см. bot/main.py) — учитывает время простоя между запусками
+# Стартовая сводка (запускается из bot/main.py фоновой задачей)
 # --------------------------------------------------------------------------- #
-async def get_last_alive(db: Database) -> float | None:
-    """Отметка времени последнего успешного тика опроса. None — бот запускается впервые."""
-    raw = await db.get_meta("last_alive_at")
+async def _meta_float(db: Database, key: str) -> float | None:
+    raw = await db.get_meta(key)
     if raw is None:
         return None
     try:
         return float(raw)
     except ValueError:
         return None
+
+
+async def get_last_alive(db: Database) -> float | None:
+    """Отметка времени последнего тика опроса. None — бот запускается впервые."""
+    return await _meta_float(db, "last_alive_at")
+
+
+def start_startup_report_task(ctx: SchedulerContext, prev_alive: float | None, boot_ts: float) -> asyncio.Task:
+    async def guarded() -> None:
+        try:
+            await deliver_startup_report(ctx, prev_alive, boot_ts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — сбой стартовой сводки не должен ронять бота
+            log.exception("сбой при доставке стартовой сводки")
+
+    return asyncio.create_task(guarded(), name="startup_report")
+
+
+async def deliver_startup_report(
+    ctx: SchedulerContext,
+    prev_alive: float | None,
+    boot_ts: float,
+    *,
+    deadline: float = STARTUP_REPORT_DEADLINE,
+    retry_every: float = STARTUP_REPORT_RETRY,
+    sleep=asyncio.sleep,
+    clock=time.time,
+) -> bool:
+    """Присылает курсы сразу после запуска бота — и после включения сервера, когда интернета ещё может
+    не быть: ждёт появления данных и связи с Telegram (не дольше `deadline`), а не пробует один раз.
+
+    Защита от спама при цикле падений — по времени последней ДОСТАВЛЕННОЙ стартовой сводки
+    (STARTUP_META_KEY), а не по `last_alive_at`: иначе бот, упавший из-за отсутствия сети, при
+    быстрых перезапусках навсегда «забыл» бы про сводку. Возвращает True, если доставлено хоть кому-то."""
+    settings = ctx.settings
+    if settings.startup_report == "off":
+        return False
+
+    last_sent = await _meta_float(ctx.db, STARTUP_META_KEY)
+    if last_sent is not None and boot_ts - last_sent < settings.startup_min_gap:
+        log.info("пропускаю стартовую сводку — предыдущая отправлена совсем недавно (защита от спама при перезапусках)")
+        return False
+
+    owners = set(settings.owner_ids)
+    pending = set(owners)
+    if settings.startup_report == "all":
+        pending |= {u.user_id for u in await ctx.db.list_users() if not u.bot_blocked}
+    if not pending:
+        return False
+
+    notice_sent = False
+    delivered = False
+    while pending and clock() - boot_ts < deadline:
+        now = clock()
+        snap = ctx.rates.snapshot()
+        if ctx.rates.fresh_btc(now) is None:
+            snap = await ctx.rates.refresh_if_stale(retry_every)  # не ждём очередного тика опроса — пробуем сами
+        if ctx.rates.fresh_btc(clock()) is None:
+            if not notice_sent:  # владельцу — один раз: «бот жив, но источники пока молчат»
+                notice_sent = True
+                await ctx.notifier.notify_owners(owners, texts.render_startup_no_data(boot_ts, settings.tz))
+            await sleep(retry_every)
+            continue
+
+        now = clock()
+        stats = await load_stats(ctx.db, now, snap.btc.price)
+        owner_text = texts.render_startup_owner(
+            snap, stats, now=now, tz=settings.tz, tz_name=settings.tz_name, prev_alive=prev_alive,
+            version=ctx.version, stale_after=settings.stale_after, booted_at=boot_ts,
+        )
+        user_text = texts.render_startup_user(snap, stats, now=now, tz=settings.tz, stale_after=settings.stale_after)
+        for uid in sorted(pending):
+            result = await ctx.notifier.send(uid, owner_text if uid in owners else user_text)
+            if result is SendResult.OK and not delivered:
+                delivered = True
+                await ctx.db.set_meta(STARTUP_META_KEY, repr(clock()))
+            if result is not SendResult.RETRY:  # RETRY — временный сбой связи, остальное — окончательно
+                pending.discard(uid)
+        if pending:
+            await sleep(retry_every)
+
+    if pending:
+        log.warning("стартовая сводка не доставлена %d получателям за %.0f мин — связь так и не появилась",
+                    len(pending), deadline / 60)
+    elif delivered:
+        log.info("стартовая сводка доставлена")
+    return delivered
